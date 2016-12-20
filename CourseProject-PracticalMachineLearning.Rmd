@@ -1,0 +1,174 @@
+---
+title: "Course Project - Practical Machine Learning"
+author: "Mathias Keip"
+date: "20 Dezember 2016"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r echo=FALSE, message=FALSE, results=FALSE, warning=FALSE}
+library(caret)
+library(rattle)
+library(randomForest)
+library(rpart)
+library(parallel)
+library(doParallel)
+```
+
+## Summary
+
+In this project we will try to predict different movements. The data for this analysis has been collected for the *Human Activity Recognition* project. Six participants have been asked to perform *Unilateral Dumbbell Biceps Curls* in five different fashions. Movement data has been collected using accelerometers on arm, forearm, belt and dumpbell. The goal of the project is not only to predict which kind of movement has been execute, but how well this was done.
+
+The fashion of the exercise is recorded in column *classe*, which we will try to predict in this project. A detailed description of the dataset and the *Human Activity Recognition* can be found on <http://groupware.les.inf.puc-rio.br/har>.
+
+## Downloading and Processing Data
+
+For this project we will use the datasets provided on the course project page, containing the features that have been extracted from the originally recorded data. For each sensor and each axis a set of features like acceleration, roll or pitch are provided.
+
+After downloading the two datasets:
+```{r cache=TRUE}
+in.training <- read.csv(url("https://d396qusza40orc.cloudfront.net/predmachlearn/pml-training.csv"), na.strings=c("NA","#DIV/0!",""))
+in.testing <- read.csv(url("https://d396qusza40orc.cloudfront.net/predmachlearn/pml-testing.csv"), na.strings=c("NA","#DIV/0!",""))
+```
+
+A check of the dimensions reveals about 19000 rows, with 160 columns, for the training set.
+
+```{r cache=TRUE}
+dim(in.training)
+```
+
+Before we do any further processing, we split the dataset _in.training_ into two partitions for training a model and validating it.
+
+```{r cache=TRUE}
+set.seed(1234)
+inTrain <- createDataPartition(y=in.training$classe, p=0.6, list=FALSE)
+training   <- in.training[inTrain, ]
+validation <- in.training[-inTrain, ]
+testing    <- in.testing
+```
+
+If we look a the column names, we can spot some interesting points, that we can use to reduce the number of columns.
+
+1. The first few columns are householding and lineage columns, we dont' need them.
+2. Furthermore the columnnames are constructed using the a scheme like: *measure*_*movement*_*sensorplacement*. We should see, if all the columns are holding valuable data. We can drop columns if they are holding no values only (NA) or if there values are near zero.
+
+So we process the dataset as shown below:
+
+Exclude the household and lineage columns
+``` {r cache=TRUE}
+col.exclude <- c("X", "user_name", "cvtd_timestamp", "raw_timestamp_part_1", "raw_timestamp_part_2", "num_window")
+training <- training[, !(names(training) %in% col.exclude)]
+validation <- validation[, !(names(validation) %in% col.exclude)]
+testing <- testing[, !(names(testing) %in% col.exclude)]
+```
+
+Exclude near-zero-value - columns
+```{r cache=TRUE}
+col.nearZV <- nearZeroVar(training)
+training <- training[, -col.nearZV]
+validation <- validation[, -col.nearZV]
+testing <- testing[, -col.nearZV]
+```
+
+Lets get the fraction of rows that have no value for each column
+```{r cache=TRUE}
+col.highNA <- sapply(training, function(y) {sum(is.na(y)) / dim(training)[1]})
+```
+
+Plotting a histogram ensures us, that the value of 0.2 we used is just fine.
+
+```{r cache=TRUE}
+hist(col.highNA)
+```
+
+Exclude with a big fraction of no value.
+
+```{r cache=TRUE}
+training <- training[, col.highNA<0.2]
+validation <- validation[, col.highNA<0.2]
+testing <- testing[, col.highNA<0.2]
+```
+
+The remaing 53 columns we use to build our model.
+
+## Building the model.
+
+We assign one class to each measurement, therefor we have a classification problem. A good starting point for our model is a random forest, which consists of multiple decision trees, which are averaged to receive a better prediction. This could slightly increase bias but should greatly improve the performance of the final model.
+
+The building process is speed up through parallelization, using packages _parallel_ and _doParallel_.
+
+### Build a simple decision tree as baseline
+
+Before building the actual model, let's build a simple decision tree using the algorithm rpart - package as baseline.
+
+```{r cache=TRUE}
+base <- train(x=training[, !(names(training) %in% c("classe"))], 
+            y=training$classe,
+            method="rpart")
+base.prediction <- predict(base, validation)
+base.prediction.cf <- confusionMatrix(base.prediction , validation$classe)
+base.prediction.cf$overall[c('Accuracy', 'AccuracyLower', 'AccuracyUpper')]
+```
+
+### Building the actual model
+
+One part of the Practical Machine Learning course is a quiz, in which we have to classify 20 test datasets which we don't know a priori. If we want to have a significant chance of getting all 20 answers correct (let's say 95%), we need a pretty high accuracy. The accuracy has to satisfy the equation 0.95 = x ^ 20, which gets us x = 0.9974 (rounded). So we need a much better model than our baseline.
+
+A look at the confusion matrix of our baseline model against validation set reveals the flaws of the model. There are classes, that are not predicted correctly. We will use a random forest get an averaged and sound model.
+
+```{r cache=TRUE}
+cluster <- makeCluster(detectCores() - 1) # convention to leave 1 core for OS
+registerDoParallel(cluster)
+
+final <- train(x=training[, !(names(training) %in% c("classe"))], 
+            y=training$classe,
+            method="rf",
+            trControl = trainControl(method="repeatedcv",
+                                     number=5, 
+                                     repeats=5, 
+                                     classProbs = TRUE,
+                                     allowParallel = TRUE))
+
+stopCluster(cluster)
+```
+
+## Prediction and Evaluation
+
+To evaluate our model, we use our predict the classe values of the training set. This gives us an upper boundary for our accuracy. We get measurement of the in sample error.
+
+```{r cache=TRUE}
+prediction.tr <- predict(final, training)
+prediction.tr.cf <- confusionMatrix(prediction.tr, training$classe)
+prediction.tr.cf$overall[c('Accuracy', 'AccuracyLower', 'AccuracyUpper')]
+```
+
+Finally let's predict the classe values for the validation set. Remember that we would like to reach an accurary about 0.9974 to get a high chance for the 20 test cases. According to our test above, that should be possible.
+
+```{r cache=TRUE}
+prediction <- predict(final, validation)
+prediction.cf <- confusionMatrix(prediction, validation$classe)
+prediction.cf$overall[c('Accuracy', 'AccuracyLower', 'AccuracyUpper')]
+```
+
+The accuracy is slighly below our calculated treshold, but using the formula above, we get still a pretty high probability to get every test case right. We also can see, that the out-of-sample error is indeed high, if only slightly.
+
+## Figures
+
+### Confusion matrix for the base line model against the validation set
+```{r cache=TRUE}
+base.prediction.cf
+```
+
+### Confusion matrix for the final model against the training set
+
+```{r cache=TRUE}
+prediction.tr.cf
+```
+
+### Confusion matrix for the final model against the validation set
+```{r cache=TRUE}
+prediction.cf
+```
